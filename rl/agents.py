@@ -1,38 +1,26 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-
-
-class ActorCritic(nn.Module):
-    def __init__(self, input_dim: int, hidden_sizes=(128, 128), n_actions: int = 2):
-        super().__init__()
-        layers = []
-        in_dim = input_dim
-        for h in hidden_sizes:
-            layers.append(nn.Linear(in_dim, h))
-            layers.append(nn.ReLU())
-            in_dim = h
-        self.shared = nn.Sequential(*layers)
-        self.policy_head = nn.Linear(in_dim, n_actions)
-        self.value_head = nn.Linear(in_dim, 1)
-
-    def forward(self, x):
-        x = self.shared(x)
-        logits = self.policy_head(x)
-        value = self.value_head(x)
-        return logits, value
+from typing import Optional, Dict, Any, List
+import numpy as np
 
 
 class A2CAgent:
-    """A simple Advantage Actor-Critic (A2C) agent.
-
-    - Uses a shared actor-critic network.
-    - Collects transitions per-episode and updates at episode end.
-    - Exposes `select_action(state, eps_threshold=0)` to match DQN API (deterministic when eps=0).
     """
-
-    def __init__(self, n_observations, n_actions, device, lr=1e-3, gamma=0.99,
-                 entropy_coef=0.01, value_coef=0.5, max_grad_norm=0.5):
+    A2C Agent implementation based on working reference implementation.
+    Uses separate Actor and Critic networks.
+    """
+    def __init__(
+        self,
+        n_observations: int,
+        n_actions: int,
+        device: torch.device,
+        lr: float = 3e-4,
+        gamma: float = 0.99,
+        entropy_coef: float = 0.01,
+        value_coef: float = 0.5,
+        max_grad_norm: float = 0.5,
+    ):
         self.device = device
         self.n_actions = n_actions
         self.gamma = gamma
@@ -40,93 +28,170 @@ class A2CAgent:
         self.value_coef = value_coef
         self.max_grad_norm = max_grad_norm
 
-        self.actor_critic = ActorCritic(n_observations, n_actions=n_actions).to(device)
-        self.optimizer = torch.optim.Adam(self.actor_critic.parameters(), lr=lr)
+        # Separate Actor and Critic networks (like working implementation)
+        self.actor = nn.Sequential(
+            nn.Linear(n_observations, 128),
+            nn.ReLU(),
+            nn.Linear(128, n_actions)
+        ).to(self.device)
+        
+        self.critic = nn.Sequential(
+            nn.Linear(n_observations, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        ).to(self.device)
+        
+        # Separate optimizers
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
 
-        # on-policy buffer for current episode
-        self.episode_buffer = []  # list of (log_prob, value, reward, entropy)
-        # temporary storage for current step's log_prob, value, entropy (set by select_action)
-        self._current_log_prob = None
-        self._current_value = None
-        self._current_entropy = None
+        # Episode buffers
+        self.log_probs: List[torch.Tensor] = []
+        self.values: List[torch.Tensor] = []
+        self.rewards: List[float] = []
+        self.entropies: List[torch.Tensor] = []
 
-    def select_action(self, state, eps_threshold=None, deterministic=False):
-        # state: tensor [1, obs]
-        logits, value = self.actor_critic(state)
-        probs = F.softmax(logits, dim=-1)
-        dist = torch.distributions.Categorical(probs)
-        if deterministic:
-            action = probs.argmax(dim=-1, keepdim=True)
-            # No gradient needed for deterministic (eval) mode
-            self._current_log_prob = None
-            self._current_value = None
-            self._current_entropy = None
+    def select_action(self, state: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+        """Select action and store log_prob, value, entropy for training."""
+        if not isinstance(state, torch.Tensor):
+            state = torch.tensor(state, dtype=torch.float32, device=self.device)
         else:
-            action = dist.sample().view(1, 1)
-            # Store with gradients for training
-            self._current_log_prob = dist.log_prob(action.view(-1))
-            self._current_value = value.squeeze(0)
-            self._current_entropy = dist.entropy()
+            state = state.to(self.device)
+        
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
 
-        return action.to(self.device)
+        # Get action probabilities from actor
+        logits = self.actor(state)
+        probs = F.softmax(logits, dim=-1)
+        
+        # Get value from critic
+        value = self.critic(state)
+        
+        if deterministic:
+            action = probs.argmax(dim=-1)
+        else:
+            # Sample action
+            dist = torch.distributions.Categorical(probs)
+            action = dist.sample()
+            
+            # Store for training (keep gradients)
+            log_prob = dist.log_prob(action)
+            entropy = dist.entropy()
+            
+            self.log_probs.append(log_prob)
+            self.values.append(value.squeeze())
+            self.entropies.append(entropy)
+
+        return action
 
     def push_transition(self, state, action, next_state, reward):
-        # Use log_prob/value/entropy computed during select_action (with gradients)
-        if self._current_log_prob is not None:
-            reward_tensor = reward if isinstance(reward, torch.Tensor) else torch.tensor([reward], device=self.device)
-            # If reward is already a tensor, extract scalar value
-            if isinstance(reward, torch.Tensor):
-                reward_val = reward.item() if reward.numel() == 1 else reward[0].item()
-                reward_tensor = torch.tensor([reward_val], device=self.device)
-            self.episode_buffer.append((
-                self._current_log_prob,
-                self._current_value,
-                reward_tensor,
-                self._current_entropy
-            ))
-            # Clear temporary storage
-            self._current_log_prob = None
-            self._current_value = None
-            self._current_entropy = None
+        """Store reward."""
+        if isinstance(reward, torch.Tensor):
+            self.rewards.append(float(reward.item()))
+        else:
+            self.rewards.append(float(reward))
 
-    def optimize(self):
-        # Run optimization using collected episode buffer. If buffer empty, skip.
-        if len(self.episode_buffer) == 0:
+    def optimize(self, last_state: Optional[torch.Tensor] = None) -> Optional[Dict[str, Any]]:
+        """Perform A2C update."""
+        if len(self.log_probs) == 0:
             return None
 
-        # compute returns
+        # Compute returns
+        R = 0.0
+        if last_state is not None:
+            with torch.no_grad():
+                if not isinstance(last_state, torch.Tensor):
+                    last_state = torch.tensor(last_state, dtype=torch.float32, device=self.device)
+                else:
+                    last_state = last_state.to(self.device)
+                
+                if last_state.dim() == 1:
+                    last_state = last_state.unsqueeze(0)
+                
+                R = self.critic(last_state).squeeze().item()
+        
         returns = []
-        R = 0
-        for _, _, reward, _ in reversed(self.episode_buffer):
+        for reward in reversed(self.rewards):
             R = reward + self.gamma * R
             returns.insert(0, R)
-
-        returns = torch.cat(returns).detach()
-        log_probs = torch.cat([lp.unsqueeze(0) for lp, _, _, _ in self.episode_buffer])
-        values = torch.cat([v.unsqueeze(0) for _, v, _, _ in self.episode_buffer]).squeeze(1)
-        entropies = torch.cat([e.unsqueeze(0) for _, _, _, e in self.episode_buffer])
-
-        advantages = returns - values
-
-        policy_loss = -(log_probs * advantages.detach()).mean()
-        value_loss = F.mse_loss(values, returns)
+        
+        returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
+        
+        # Stack stored tensors
+        log_probs = torch.stack(self.log_probs)
+        values = torch.stack(self.values)
+        entropies = torch.stack(self.entropies)
+        
+        # Compute advantages
+        advantages = returns - values.detach()
+        
+        # Compute losses
+        actor_loss = -(log_probs * advantages).mean()
+        critic_loss = F.mse_loss(values, returns)
         entropy_loss = -entropies.mean()
-
-        loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
-
-        self.optimizer.zero_grad()
+        
+        # Total loss
+        loss = actor_loss + self.value_coef * critic_loss + self.entropy_coef * entropy_loss
+        
+        # Optimize
+        self.actor_optimizer.zero_grad()
+        self.critic_optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-        self.optimizer.step()
-
-        # clear buffer
-        self.episode_buffer = []
-
-        return loss.item()
+        
+        # Clip gradients
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.actor.parameters(), 
+            self.max_grad_norm
+        )
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.critic.parameters(), 
+            self.max_grad_norm
+        )
+        
+        self.actor_optimizer.step()
+        self.critic_optimizer.step()
+        
+        # Metrics
+        metrics = {
+            "loss": loss.item(),
+            "policy_loss": actor_loss.item(),
+            "value_loss": critic_loss.item(),
+            "entropy": entropies.mean().item(),
+            "advantages_mean": advantages.mean().item(),
+            "advantages_std": advantages.std().item() if len(advantages) > 1 else 0.0,
+            "grad_norm": (actor_grad_norm.item() if isinstance(actor_grad_norm, torch.Tensor) else actor_grad_norm),
+            "mean_value": values.mean().item(),
+            "mean_return": returns.mean().item(),
+        }
+        
+        # Clear buffers
+        self.log_probs = []
+        self.values = []
+        self.rewards = []
+        self.entropies = []
+        
+        return metrics
 
     def save(self, path: str):
-        torch.save({'policy_state_dict': self.actor_critic.state_dict()}, path)
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+        }, path)
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-        self.actor_critic.load_state_dict(ckpt['policy_state_dict'])
+        # Support old format (policy_state_dict) and new format (actor/critic)
+        if 'policy_state_dict' in ckpt:
+            # Old format: load weights into both actor and critic if possible
+            self.actor.load_state_dict(ckpt['policy_state_dict'], strict=False)
+            self.critic.load_state_dict(ckpt['policy_state_dict'], strict=False)
+        else:
+            self.actor.load_state_dict(ckpt['actor_state_dict'])
+            self.critic.load_state_dict(ckpt['critic_state_dict'])
+            if 'actor_optimizer_state_dict' in ckpt:
+                self.actor_optimizer.load_state_dict(ckpt['actor_optimizer_state_dict'])
+            if 'critic_optimizer_state_dict' in ckpt:
+                self.critic_optimizer.load_state_dict(ckpt['critic_optimizer_state_dict'])

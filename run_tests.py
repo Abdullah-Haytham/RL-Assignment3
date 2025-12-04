@@ -1,7 +1,7 @@
 """Run a trained model for N episodes and log episode durations to WandB and CSV.
 
 Usage:
-    python run_tests.py --env CartPole-v1 --model models/CartPole-v1_dqn.pt --episodes 100
+    python run_tests.py --env CartPole-v1 --algo ppo --model models/CartPole-v1_ppo_final.pt --episodes 100
 """
 import argparse
 import csv
@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import wandb
 
-from rl.agents import A2CAgent
+from rl.agents import A2CAgent, PPOAgent
 
 
 class DiscretizeAction(ActionWrapper):
@@ -70,14 +70,29 @@ def make_env(env_name, seed=None, record_video=False, video_folder="videos", alg
     return env
 
 
-def run_tests(env_name: str, model_path: str, episodes: int = 100, device: str = None, project: str = "rl-dqn", entity: str = None, record_video: bool = False):
+def run_tests(
+    env_name: str,
+    model_path: str,
+    algo: str = "a2c",
+    episodes: int = 100,
+    device: str = None,
+    project: str = "rl-dqn",
+    entity: str = None,
+    record_video: bool = False,
+):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
+    algo = algo.lower()
+
     model_name = Path(model_path).stem
-    algo = 'a2c'
 
     run_name = f"test_{algo}_{env_name}_{episodes}eps"
-    run = wandb.init(project="rl-ass4", entity=entity, name=run_name, config={'env': env_name, 'model_path': model_path, 'episodes': episodes})
+    run = wandb.init(
+        project=project,
+        entity=entity,
+        name=run_name,
+        config={'env': env_name, 'model_path': model_path, 'episodes': episodes, 'algo': algo},
+    )
 
     env = make_env(env_name, record_video=record_video, algo=algo)
     obs, _ = env.reset()
@@ -85,9 +100,23 @@ def run_tests(env_name: str, model_path: str, episodes: int = 100, device: str =
     n_actions = env.action_space.n
 
     # instantiate agent only to hold network structure; weights will be loaded
-    agent = A2CAgent(n_observations, n_actions, device=device)
+    if algo == "a2c":
+        agent = A2CAgent(n_observations, n_actions, device=device)
+    elif algo == "ppo":
+        agent = PPOAgent(n_observations, n_actions, device=device)
+    else:
+        raise ValueError(f"Unsupported algo '{algo}'. Use 'a2c' or 'ppo'.")
 
     agent.load(model_path)
+
+    def select_eval_action(state_tensor: torch.Tensor) -> int:
+        if isinstance(agent, PPOAgent):
+            with torch.no_grad():
+                logits = agent.actor(state_tensor)
+                probs = torch.softmax(logits, dim=-1)
+                return int(torch.argmax(probs, dim=-1).item())
+        action = agent.select_action(state_tensor, deterministic=True)
+        return int(action.item()) if torch.is_tensor(action) else int(action)
 
     durations = []
     os.makedirs('results', exist_ok=True)
@@ -101,9 +130,8 @@ def run_tests(env_name: str, model_path: str, episodes: int = 100, device: str =
             done = False
             t = 0
             while not done:
-                with torch.no_grad():
-                    action = agent.select_action(state, deterministic=True)
-                obs, reward, terminated, truncated, _ = env.step(int(action.item()))
+                action = select_eval_action(state)
+                obs, reward, terminated, truncated, _ = env.step(int(action))
                 done = terminated or truncated
                 if terminated:
                     state = None
@@ -122,6 +150,7 @@ def run_tests(env_name: str, model_path: str, episodes: int = 100, device: str =
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='CartPole-v1')
+    parser.add_argument('--algo', type=str, choices=['a2c', 'ppo'], default='a2c')
     parser.add_argument('--model', type=str, required=True)
     parser.add_argument('--episodes', type=int, default=100)
     parser.add_argument('--record-video', action='store_true')
@@ -129,4 +158,12 @@ if __name__ == '__main__':
     parser.add_argument('--entity', type=str, default=None)
     args = parser.parse_args()
 
-    run_tests(env_name=args.env, model_path=args.model, episodes=args.episodes, record_video=args.record_video, project=args.project, entity=args.entity)
+    run_tests(
+        env_name=args.env,
+        model_path=args.model,
+        algo=args.algo,
+        episodes=args.episodes,
+        record_video=args.record_video,
+        project=args.project,
+        entity=args.entity,
+    )

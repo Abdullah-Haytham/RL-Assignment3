@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import wandb
 
-from rl.agents import A2CAgent
+from rl.agents import A2CAgent, PPOAgent
 
 
 class DiscretizeAction(ActionWrapper):
@@ -98,16 +98,29 @@ def train(
     obs, _ = env.reset(seed=seed)
     n_observations = len(obs)
 
-    agent = A2CAgent(
-        n_observations, 
-        n_actions, 
-        device=device, 
-        lr=lr, 
-        gamma=gamma, 
-        entropy_coef=entropy_coef, 
-        value_coef=value_coef, 
-        max_grad_norm=max_grad_norm
-    )
+    if algo.lower() == "a2c":
+        agent = A2CAgent(
+            n_observations, 
+            n_actions, 
+            device=device, 
+            lr=lr, 
+            gamma=gamma, 
+            entropy_coef=entropy_coef, 
+            value_coef=value_coef, 
+            max_grad_norm=max_grad_norm
+        )
+    elif algo.lower() == "ppo":
+        agent = PPOAgent(
+            n_observations, 
+            n_actions, 
+            device=device, 
+            lr=lr, 
+            gamma=gamma, 
+            entropy_coef=entropy_coef, 
+            value_coef=value_coef, 
+            max_grad_norm=max_grad_norm
+        )
+
 
     print(f"Training {algo.upper()} on {env_name} for {episodes} episodes...")
     print(f"Device: {device}, Actions: {n_actions}, Observations: {n_observations}")
@@ -123,7 +136,7 @@ def train(
             action = agent.select_action(state, deterministic=False)
             
             # Take step in environment
-            obs, reward, terminated, truncated, _ = env.step(int(action.item()))
+            obs, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             
             # Store transition
@@ -188,7 +201,7 @@ def train(
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='CartPole-v1')
-    parser.add_argument('--algo', type=str, choices=['a2c'], default='a2c')
+    parser.add_argument('--algo', type=str, choices=['a2c', 'ppo'], default='a2c')
     parser.add_argument('--episodes', type=int, default=500)
     parser.add_argument('--learning-rate', '--lr', type=float, default=3e-4)
     parser.add_argument('--gamma', type=float, default=0.99)

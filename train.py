@@ -7,7 +7,9 @@ import numpy as np
 import torch
 import wandb
 
-from rl.agents import A2CAgent
+from typing import Optional, Union
+
+from rl.agents import A2CAgent, SACAgent
 
 
 class DiscretizeAction(ActionWrapper):
@@ -37,7 +39,7 @@ class DiscretizeAction(ActionWrapper):
 
 
 def make_env(env_name, seed=None, record_video=False, video_folder="videos", algo=None,
-             n_discrete_actions=11, video_frequency=50):
+            n_discrete_actions=11, video_frequency=50):
     render_mode = 'rgb_array' if record_video else None
     env = gym.make(env_name, render_mode=render_mode)
     if isinstance(env.action_space, spaces.Box):
@@ -69,19 +71,26 @@ def train(
     value_coef: float = 0.5,
     max_grad_norm: float = 0.5,
     record_video: bool = False,
-    device: str = None,
+    device: Optional[str] = None,
     project: str = "rl-ass4",
-    entity: str = None,
+    entity: Optional[str] = None,
     seed: int = 42,
+    sac_alpha: float = 0.2,
+    sac_tau: float = 0.005,
+    sac_replay_size: int = 100_000,
+    sac_batch_size: int = 64,
+    sac_warmup_steps: int = 1000,
+    sac_updates_per_optimize: int = 1,
 ):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device_name = device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+    torch_device = torch.device(device_name)
     
     # Set seeds
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     run_name = f"{algo}_{env_name}_{episodes}eps"
-    run = wandb.init(project=project, entity=entity, name=run_name, config={
+    config = {
         'env': env_name,
         'algo': algo,
         'episodes': episodes,
@@ -91,57 +100,109 @@ def train(
         'value_coef': value_coef,
         'max_grad_norm': max_grad_norm,
         'seed': seed,
-    })
+    }
+    if algo == 'sac':
+        config.update({
+            'sac_alpha': sac_alpha,
+            'sac_tau': sac_tau,
+            'sac_replay_size': sac_replay_size,
+            'sac_batch_size': sac_batch_size,
+            'sac_warmup_steps': sac_warmup_steps,
+            'sac_updates_per_optimize': sac_updates_per_optimize,
+        })
+
+    run = wandb.init(project=project, entity=entity, name=run_name, config=config)
 
     env = make_env(env_name, seed=seed, record_video=record_video, algo=algo)
-    n_actions = env.action_space.n
     obs, _ = env.reset(seed=seed)
-    n_observations = len(obs)
+    obs_array = np.asarray(obs, dtype=np.float32)
+    obs_vector = obs_array.reshape(-1)
+    n_observations = obs_vector.shape[0]
 
-    agent = A2CAgent(
-        n_observations, 
-        n_actions, 
-        device=device, 
-        lr=lr, 
-        gamma=gamma, 
-        entropy_coef=entropy_coef, 
-        value_coef=value_coef, 
-        max_grad_norm=max_grad_norm
-    )
+    action_space = env.action_space
+    agent: Union[A2CAgent, SACAgent]
+    if isinstance(action_space, spaces.Discrete):
+        n_actions = int(action_space.n)
+        if algo == 'sac':
+            agent = SACAgent(
+                n_observations,
+                n_actions,
+                device=torch_device,
+                lr=lr,
+                gamma=gamma,
+                tau=sac_tau,
+                alpha=sac_alpha,
+                value_coef=value_coef,
+                entropy_coef=entropy_coef,
+                max_grad_norm=max_grad_norm,
+                replay_size=sac_replay_size,
+                batch_size=sac_batch_size,
+                warmup_steps=sac_warmup_steps,
+                updates_per_optimize=sac_updates_per_optimize,
+            )
+        else:
+            agent = A2CAgent(
+                n_observations,
+                n_actions,
+                device=torch_device,
+                lr=lr,
+                gamma=gamma,
+                entropy_coef=entropy_coef,
+                value_coef=value_coef,
+                max_grad_norm=max_grad_norm,
+            )
+    else:
+        raise ValueError(
+            "Expecting a discrete action space. Consider enabling discretization or choosing a supported environment."
+        )
 
     print(f"Training {algo.upper()} on {env_name} for {episodes} episodes...")
-    print(f"Device: {device}, Actions: {n_actions}, Observations: {n_observations}")
+    action_caption = f"Actions: {int(action_space.n)}"
+    print(f"Device: {torch_device.type}, {action_caption}, Observations: {n_observations}")
     
     for i_episode in range(episodes):
         obs, _ = env.reset()
-        state = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+        obs_vec = np.asarray(obs, dtype=np.float32).reshape(-1)
+        state = torch.tensor(obs_vec, dtype=torch.float32, device=torch_device).unsqueeze(0)
         total_reward = 0.0
         t = 0
+        last_metrics = None
+        current_obs = obs_vec
         
         while True:
-            # Select action (no gradients needed during rollout)
-            action = agent.select_action(state, deterministic=False)
-            
-            # Take step in environment
-            obs, reward, terminated, truncated, _ = env.step(int(action.item()))
+            action_tensor = agent.select_action(state, deterministic=False)
+            action_value = int(action_tensor.item())
+            next_obs, reward, terminated, truncated, _ = env.step(action_value)
+            reward_value = float(reward)
             done = terminated or truncated
             
-            # Store transition
-            next_state = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            agent.push_transition(state, action, next_state, reward)
-            
+            next_obs_vec = np.asarray(next_obs, dtype=np.float32).reshape(-1)
+            next_state = torch.tensor(next_obs_vec, dtype=torch.float32, device=torch_device).unsqueeze(0)
+
+            if isinstance(agent, SACAgent):
+                agent.push_transition(current_obs, action_value, next_obs_vec, reward_value, done)
+                step_metrics = agent.optimize()
+                if step_metrics is not None:
+                    last_metrics = step_metrics
+            else:
+                agent.push_transition(state, action_tensor, next_state, reward_value)
+
             state = next_state
-            total_reward += reward
+            current_obs = next_obs_vec
+            total_reward += reward_value
             t += 1
 
             if done:
                 # Optimize at end of episode
-                if truncated:
-                    # Bootstrap from last state if truncated
-                    metrics = agent.optimize(last_state=state)
+                if isinstance(agent, SACAgent):
+                    metrics = last_metrics
                 else:
-                    # No bootstrap if terminated naturally
-                    metrics = agent.optimize(last_state=None)
+                    if truncated:
+                        # Bootstrap from last state if truncated
+                        metrics = agent.optimize(last_state=state)
+                    else:
+                        # No bootstrap if terminated naturally
+                        metrics = agent.optimize(last_state=None)
                 
                 # Log metrics
                 if metrics is not None:
@@ -157,6 +218,14 @@ def train(
                         'train/episode_length': t,
                         'train/episode': i_episode
                     }
+                    optional_metric_mapping = {
+                        'mean_q': 'train/mean_q',
+                        'replay_buffer_size': 'train/replay_buffer_size',
+                        'actor_entropy': 'train/actor_entropy',
+                    }
+                    for optional_key, wandb_key in optional_metric_mapping.items():
+                        if optional_key in metrics:
+                            log_dict[wandb_key] = metrics[optional_key]
                     run.log(log_dict)
                 
                 # Print progress
@@ -164,7 +233,7 @@ def train(
                     loss_str = f"{metrics['loss']:.3f}" if metrics else "N/A"
                     entropy_str = f"{metrics['entropy']:.3f}" if metrics else "N/A"
                     print(f"Episode {i_episode + 1}/{episodes} - Reward: {total_reward:.1f}, Length: {t}, "
-                          f"Loss: {loss_str}, Entropy: {entropy_str}")
+                        f"Loss: {loss_str}, Entropy: {entropy_str}")
                 
                 break
 
@@ -188,7 +257,7 @@ def train(
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='CartPole-v1')
-    parser.add_argument('--algo', type=str, choices=['a2c'], default='a2c')
+    parser.add_argument('--algo', type=str, choices=['a2c', 'sac'], default='a2c')
     parser.add_argument('--episodes', type=int, default=500)
     parser.add_argument('--learning-rate', '--lr', type=float, default=3e-4)
     parser.add_argument('--gamma', type=float, default=0.99)
@@ -199,6 +268,13 @@ if __name__ == '__main__':
     parser.add_argument('--project', type=str, default='rl-ass4')
     parser.add_argument('--entity', type=str, default=None)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--sac-alpha', type=float, default=0.2)
+    parser.add_argument('--sac-tau', type=float, default=0.005)
+    parser.add_argument('--sac-replay-size', type=int, default=100_000)
+    parser.add_argument('--sac-batch-size', type=int, default=64)
+    parser.add_argument('--sac-warmup-steps', type=int, default=1000)
+    parser.add_argument('--sac-updates-per-optimize', type=int, default=1)
     args = parser.parse_args()
 
     train(
@@ -214,4 +290,11 @@ if __name__ == '__main__':
         project=args.project,
         entity=args.entity,
         seed=args.seed,
+        device=args.device,
+        sac_alpha=args.sac_alpha,
+        sac_tau=args.sac_tau,
+        sac_replay_size=args.sac_replay_size,
+        sac_batch_size=args.sac_batch_size,
+        sac_warmup_steps=args.sac_warmup_steps,
+        sac_updates_per_optimize=args.sac_updates_per_optimize,
     )

@@ -7,6 +7,7 @@ import argparse
 import csv
 import os
 from pathlib import Path
+from typing import Optional, Union
 
 import gymnasium as gym
 from gymnasium import ActionWrapper, spaces
@@ -14,7 +15,7 @@ import numpy as np
 import torch
 import wandb
 
-from rl.agents import A2CAgent
+from rl.agents import A2CAgent, SACAgent
 
 
 class DiscretizeAction(ActionWrapper):
@@ -44,7 +45,7 @@ class DiscretizeAction(ActionWrapper):
 
 
 def make_env(env_name, seed=None, record_video=False, video_folder="videos", algo=None,
-             n_discrete_actions=11, video_frequency=50):
+            n_discrete_actions=15, video_frequency=50):
     render_mode = 'rgb_array' if record_video else None
     env = gym.make(env_name, render_mode=render_mode)
     if isinstance(env.action_space, spaces.Box):
@@ -70,22 +71,60 @@ def make_env(env_name, seed=None, record_video=False, video_folder="videos", alg
     return env
 
 
-def run_tests(env_name: str, model_path: str, episodes: int = 100, device: str = None, project: str = "rl-dqn", entity: str = None, record_video: bool = False):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+def run_tests(
+    env_name: str,
+    model_path: str,
+    episodes: int = 100,
+    device: Optional[str] = None,
+    project: str = "rl-dqn",
+    entity: Optional[str] = None,
+    record_video: bool = False,
+    algo: str = "a2c",
+):
+    device_name = device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
+    torch_device = torch.device(device_name)
 
     model_name = Path(model_path).stem
-    algo = 'a2c'
 
     run_name = f"test_{algo}_{env_name}_{episodes}eps"
-    run = wandb.init(project="rl-ass4", entity=entity, name=run_name, config={'env': env_name, 'model_path': model_path, 'episodes': episodes})
+    run = wandb.init(
+        project="rl-ass4",
+        entity=entity,
+        name=run_name,
+        config={
+            'env': env_name,
+            'model_path': model_path,
+            'episodes': episodes,
+            'algo': algo,
+        }
+    )
 
     env = make_env(env_name, record_video=record_video, algo=algo)
     obs, _ = env.reset()
-    n_observations = len(obs)
-    n_actions = env.action_space.n
+    obs_array = np.asarray(obs, dtype=np.float32).reshape(-1)
+    n_observations = obs_array.shape[0]
+    action_space = env.action_space
 
-    # instantiate agent only to hold network structure; weights will be loaded
-    agent = A2CAgent(n_observations, n_actions, device=device)
+    if not isinstance(action_space, spaces.Discrete):
+        raise ValueError("Testing expects a discrete action space. Consider discretizing continuous actions first.")
+
+    n_actions = int(action_space.n)
+
+    if algo == 'sac':
+        agent: Union[A2CAgent, SACAgent] = SACAgent(
+            n_observations,
+            n_actions,
+            device=torch_device,
+            lr=3e-4,
+            gamma=0.99,
+            tau=0.005,
+            alpha=0.2,
+            value_coef=0.5,
+            entropy_coef=0.01,
+            max_grad_norm=0.5,
+        )
+    else:
+        agent = A2CAgent(n_observations, n_actions, device=torch_device)
 
     agent.load(model_path)
 
@@ -97,18 +136,18 @@ def run_tests(env_name: str, model_path: str, episodes: int = 100, device: str =
         writer.writerow(['episode', 'length'])
         for i in range(episodes):
             obs, _ = env.reset()
-            state = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            obs_array = np.asarray(obs, dtype=np.float32).reshape(-1)
+            state = torch.tensor(obs_array, dtype=torch.float32, device=torch_device).unsqueeze(0)
             done = False
             t = 0
             while not done:
                 with torch.no_grad():
-                    action = agent.select_action(state, deterministic=True)
-                obs, reward, terminated, truncated, _ = env.step(int(action.item()))
+                    action_tensor = agent.select_action(state, deterministic=True)
+                    obs, reward, terminated, truncated, _ = env.step(int(action_tensor.item()))
                 done = terminated or truncated
-                if terminated:
-                    state = None
-                else:
-                    state = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                if not done:
+                    obs_array = np.asarray(obs, dtype=np.float32).reshape(-1)
+                    state = torch.tensor(obs_array, dtype=torch.float32, device=torch_device).unsqueeze(0)
                 t += 1
             durations.append(t)
             writer.writerow([i, t])
@@ -127,6 +166,15 @@ if __name__ == '__main__':
     parser.add_argument('--record-video', action='store_true')
     parser.add_argument('--project', type=str, default='rl-dqn')
     parser.add_argument('--entity', type=str, default=None)
+    parser.add_argument('--algo', type=str, choices=['a2c', 'sac'], default='a2c')
     args = parser.parse_args()
 
-    run_tests(env_name=args.env, model_path=args.model, episodes=args.episodes, record_video=args.record_video, project=args.project, entity=args.entity)
+    run_tests(
+        env_name=args.env,
+        model_path=args.model,
+        episodes=args.episodes,
+        record_video=args.record_video,
+        project=args.project,
+        entity=args.entity,
+        algo=args.algo,
+    )
